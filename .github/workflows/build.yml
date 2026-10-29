@@ -1,0 +1,142 @@
+name: Build Al-Quran APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Also build a signed release APK (needs the AQ_* secrets)'
+        type: boolean
+        default: false
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # Source can be committed unzipped, or as a .zip (easy to upload from a phone)
+      - name: Locate source
+        run: |
+          for z in $(ls -tr *.zip 2>/dev/null); do
+            if ! unzip -tq "$z" >/dev/null 2>&1; then
+              echo "::warning::$z is damaged (upload was cut off) - skipped. Upload it again."
+              continue
+            fi
+            echo "Unpacking $z"
+            unzip -q -o "$z"
+          done
+          S=$(find . -maxdepth 4 -name 'settings.gradle*' -not -path './.git/*' | head -1)
+          if [ -z "$S" ]; then echo "settings.gradle(.kts) not found anywhere in the repo"; ls -R | head -50; exit 1; fi
+          echo "SRC=$(dirname "$S")" >> "$GITHUB_ENV"
+          echo "Source folder: $(dirname "$S")"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-35 build-tools;35.0.0'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Set version (newer on every build)
+        run: |
+          echo "AQ_VERSION_CODE=$((1000 + GITHUB_RUN_NUMBER))" >> "$GITHUB_ENV"
+          echo "AQ_VERSION_NAME=1.0.${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+
+      # Private signing key: add secrets AQ_KEYSTORE_B64 (base64 of the keystore), AQ_KS_PASS, AQ_KEY_ALIAS, AQ_KEY_PASS
+      # in the repo's Settings -> Secrets -> Actions. Without them only the debug APK (debug key) is built.
+      - name: Prepare signing key
+        env:
+          KS_B64: ${{ secrets.AQ_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.AQ_KS_PASS }}
+          KEY_ALIAS: ${{ secrets.AQ_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.AQ_KEY_PASS }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/aq-private.keystore"
+            {
+              echo "AQ_KEYSTORE=$RUNNER_TEMP/aq-private.keystore"
+              echo "AQ_KS_PASS=$KS_PASS"
+              echo "AQ_KEY_ALIAS=$KEY_ALIAS"
+              echo "AQ_KEY_PASS=$KEY_PASS"
+            } >> "$GITHUB_ENV"
+            echo "Private signing key loaded from secrets"
+          else
+            echo "No private key secrets - release APK will be skipped"
+          fi
+
+      - name: Create local.properties
+        working-directory: ${{ env.SRC }}
+        run: echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+      - name: Build debug APK
+        working-directory: ${{ env.SRC }}
+        run: |
+          set -o pipefail
+          gradle :app:assembleDebug --no-daemon --console=plain 2>&1 | tee build.log
+
+      - name: Build signed release APK
+        if: inputs.release == true && env.AQ_KEYSTORE != ''
+        working-directory: ${{ env.SRC }}
+        run: |
+          set -o pipefail
+          gradle :app:assembleRelease --no-daemon --console=plain 2>&1 | tee -a build.log
+
+      # Only runs when a build step fails: prints the real error lines on the run's Summary page
+      - name: Show the real error
+        if: failure()
+        working-directory: ${{ env.SRC }}
+        run: |
+          {
+            echo '## Build error summary'
+            echo '```'
+            grep -nE "^e: |^w: .*error|error:|What went wrong|Execution failed for task|Unresolved reference|AAPT|Could not resolve|Duplicate|KSP" -A4 build.log | head -90
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect APK
+        run: |
+          mkdir -p out
+          D=$(find "$SRC/app/build/outputs/apk/debug" -name '*.apk' | head -1)
+          cp "$D" "out/AlQuranNeu-${AQ_VERSION_NAME}-debug.apk"
+          R=$(find "$SRC/app/build/outputs/apk/release" -name '*.apk' 2>/dev/null | head -1)
+          [ -n "$R" ] && cp "$R" "out/AlQuranNeu-${AQ_VERSION_NAME}-release.apk"
+          ls -la out
+
+      # Direct-download release (private if your repo is private)
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" out/*.apk \
+            --title "Al-Quran build ${{ github.run_number }}" \
+            --notes "Neumorphic Al-Quran reader, version ${AQ_VERSION_NAME}"
+
+      # Keep only the newest 5 releases
+      - name: Clean old releases
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --limit 200 --json tagName --jq '.[].tagName' | tail -n +6 | while read -r t; do
+            gh release delete "$t" --cleanup-tag --yes || true
+          done
+
+      # Optional artifact copy; a full free quota must never fail the build (the Release already has the APK)
+      - uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: AlQuranNeu-apk
+          path: out/*.apk
+          retention-days: 1
